@@ -1,0 +1,692 @@
+diff -ruN a/modules/globals/GlobalStates.qml b/modules/globals/GlobalStates.qml
+--- a/modules/globals/GlobalStates.qml	2026-11-01 01:39:58.814491783 +0100
++++ b/modules/globals/GlobalStates.qml	2026-11-01 01:39:58.806516419 +0100
+@@ -609,11 +609,6 @@
+     // ASSISTANT SIDEBAR STATE
+     // ═══════════════════════════════════════════════════════════════
+     property bool assistantVisible: false
+-    property bool windowSwitcherActive: false
+-    property int windowSwitcherDirection: 1
+-    property bool windowSwitcherAcceptPending: false
+-    signal windowSwitcherStepRequested(int direction)
+-    signal windowSwitcherAcceptRequested()
+     property bool assistantPinned: Config.ai.sidebarPinnedOnStartup ?? false
+     property int assistantWidth: Config.ai.sidebarWidth ?? 400
+     property string assistantPosition: Config.ai.sidebarPosition ?? "right"
+diff -ruN a/modules/services/AxctlService.qml b/modules/services/AxctlService.qml
+--- a/modules/services/AxctlService.qml	2026-11-01 01:39:58.866752843 +0100
++++ b/modules/services/AxctlService.qml	2026-11-01 01:39:58.861848585 +0100
+@@ -120,7 +120,7 @@
+                 };
+             });
+             root.clients.values = mappedClients;
+-            const focused = mappedClients.find(w => w.address === (root.focusedClient ? root.focusedClient.address : undefined)) || mappedClients.find(w => w.is_focused) || null;
++            const focused = mappedClients.find(w => w.is_focused) || mappedClients.find(w => w.address === (root.focusedClient ? root.focusedClient.address : undefined)) || null;
+             if (focused !== root.focusedClient) {
+                 root.focusedClient = focused;
+             }
+diff -ruN a/modules/services/GlobalShortcuts.qml b/modules/services/GlobalShortcuts.qml
+--- a/modules/services/GlobalShortcuts.qml	2026-11-01 01:39:58.822848488 +0100
++++ b/modules/services/GlobalShortcuts.qml	2026-11-01 01:39:58.819395090 +0100
+@@ -62,14 +62,9 @@
+                     toggleSimpleModule("overview");
+                 }
+                 break;
+-            case "window-switcher": cycleWindows(1); break;
+-            case "window-switcher-backward": cycleWindows(-1); break;
+-            case "window-switcher-accept":
+-                if (GlobalStates.windowSwitcherActive) {
+-                    GlobalStates.windowSwitcherAcceptPending = true;
+-                    GlobalStates.windowSwitcherAcceptRequested();
+-                }
+-                break;
++            case "window-switcher": WindowSwitcher.step(1); break;
++            case "window-switcher-backward": WindowSwitcher.step(-1); break;
++            case "window-switcher-accept": WindowSwitcher.accept(); break;
+             case "powermenu": toggleSimpleModule("powermenu"); break;
+             case "tools": toggleSimpleModule("tools"); break;
+             case "config": toggleSettings(); break;
+@@ -125,6 +120,8 @@
+     // route it into the same runner. `ambxst toggle <target>` pushes a
+     // separate "ui.toggle" event with its own state-flipping switch.
+     Component.onCompleted: {
++        // Singletons are lazy, the switcher must track focus from the start.
++        void WindowSwitcher.session;
+         BackendService.addSubscription(["ui"], (service, data) => {
+             if (typeof data !== "string" || data === "")
+                 return;
+@@ -145,18 +142,6 @@
+         }
+     }
+ 
+-    function cycleWindows(direction) {
+-        if (GlobalStates.windowSwitcherActive && Visibilities.currentActiveModule === "overview") {
+-            GlobalStates.windowSwitcherStepRequested(direction);
+-            return;
+-        }
+-        if (Visibilities.currentActiveModule === "overview") Visibilities.setActiveModule("");
+-        GlobalStates.windowSwitcherDirection = direction;
+-        GlobalStates.windowSwitcherAcceptPending = false;
+-        GlobalStates.windowSwitcherActive = true;
+-        Visibilities.setActiveModule("overview");
+-    }
+-
+     function toggleSettings(screenName) {
+         const willOpen = !GlobalStates.settingsWindowVisible;
+         if (willOpen) {
+diff -ruN a/modules/services/WindowSwitcher.qml b/modules/services/WindowSwitcher.qml
+--- a/modules/services/WindowSwitcher.qml	1970-01-01 01:00:00.000000000 +0100
++++ b/modules/services/WindowSwitcher.qml	2026-11-01 11:03:56.264357755 +0100
+@@ -0,0 +1,198 @@
++pragma Singleton
++
++import QtQuick
++import Quickshell
++import Quickshell.Io
++import qs.modules.globals
++
++// Windows style Alt+Tab session. A quick tap switches without any UI, the list
++// appears only while Alt stays held, and releasing Alt commits the selection.
++Singleton {
++    id: root
++
++    readonly property int showDelay: 70
++    // A preview that never arrives must not hold the list back for long.
++    readonly property int previewWait: 130
++
++    property bool session: false
++    property bool shown: false
++    // The overlay maps invisibly at session start so previews are ready when it appears.
++    property bool delayPassed: false
++    property bool previewsReady: false
++    property bool previewWaitOver: false
++    readonly property bool revealed: shown && delayPassed && (previewsReady || previewWaitOver)
++    property var windows: []
++    property int selectedIndex: 0
++
++    // Most recently used addresses, resynced from the compositor shortly after focus changes.
++    property var mru: []
++    property int sessionCount: 0
++    property real closedAt: 0
++    property string lastFocused: ""
++
++    function touch(address) {
++        if (address) root.mru = [address].concat(root.mru.filter(a => a !== address));
++    }
++
++    function snapshot() {
++        const clients = (AxctlService.clients.values || []).filter(c => c.workspace && c.workspace.id !== 0);
++        const rank = address => {
++            const i = root.mru.indexOf(address);
++            return i === -1 ? root.mru.length : i;
++        };
++        return clients.slice().sort((a, b) => rank(a.address) - rank(b.address));
++    }
++
++    function step(direction) {
++        if (!root.session) {
++            const list = root.snapshot();
++            if (list.length < 2) return;
++            root.windows = list;
++            root.selectedIndex = 0;
++            root.session = true;
++            root.sessionCount++;
++            syncTimer.stop();
++            root.delayPassed = false;
++            root.previewsReady = false;
++            root.previewWaitOver = false;
++            root.shown = true;
++            Visibilities.setActiveModule("overview");
++            showTimer.restart();
++            previewWaitTimer.restart();
++        }
++        const n = root.windows.length;
++        root.selectedIndex = (root.selectedIndex + direction + n) % n;
++        if (earlyAcceptTimer.running) {
++            earlyAcceptTimer.stop();
++            root.accept();
++        }
++    }
++
++    function accept(index) {
++        if (!root.session) {
++            // Binds spawn separate processes, a very quick release can overtake its Tab.
++            // Right after a session this is only the second notice of the same release.
++            if (Date.now() - root.closedAt > 200) earlyAcceptTimer.restart();
++            return;
++        }
++        const target = root.windows[index === undefined ? root.selectedIndex : index];
++        const wasRevealed = root.revealed;
++        root.close();
++        if (!target) return;
++        // Update now so the next tap is correct before the focus event arrives.
++        root.touch(target.address);
++        if (wasRevealed) {
++            // Focusing before the overlay is gone bounces back to the previous window.
++            refocusTimer.address = target.address;
++            refocusTimer.restart();
++        } else {
++            AxctlService.dispatch(`focuswindow address:${target.address}`);
++        }
++    }
++
++    function cancel() {
++        if (root.session) root.close();
++    }
++
++    function close() {
++        showTimer.stop();
++        previewWaitTimer.stop();
++        root.session = false;
++        root.closedAt = Date.now();
++        syncTimer.restart();
++        if (root.shown) {
++            // Close first: with the overlay still open the Loader would swap to the workspace overview.
++            if (Visibilities.currentActiveModule === "overview") Visibilities.setActiveModule("");
++            root.shown = false;
++        }
++    }
++
++    // The overlay was closed from outside, for example by a click on the backdrop.
++    function overlayClosed() {
++        if (root.shown) {
++            root.shown = false;
++            root.cancel();
++        }
++    }
++
++    Timer {
++        id: showTimer
++        interval: root.showDelay
++        onTriggered: root.delayPassed = true
++    }
++
++    Timer {
++        id: previewWaitTimer
++        interval: root.previewWait
++        onTriggered: root.previewWaitOver = true
++    }
++
++    Timer {
++        id: earlyAcceptTimer
++        interval: 150
++    }
++
++    Timer {
++        id: refocusTimer
++        property string address: ""
++        interval: 40
++        onTriggered: AxctlService.dispatch(`focuswindow address:${address}`)
++    }
++
++    Connections {
++        target: AxctlService
++        function onFocusedClientChanged() {
++            const address = AxctlService.focusedClient?.address;
++            if (!address || address === root.lastFocused) return;
++            root.lastFocused = address;
++            if (refocusTimer.running) return;
++            root.touch(address);
++            // Quick focus changes can skip windows here, the compositor has the full order.
++            if (!root.session) syncTimer.restart();
++        }
++    }
++
++    Connections {
++        target: AxctlService.clients
++        function onValuesChanged() {
++            if (!root.session) return;
++            const alive = (AxctlService.clients.values || []).map(c => c.address);
++            const selected = root.windows[root.selectedIndex]?.address;
++            const list = root.windows.filter(w => alive.includes(w.address));
++            if (list.length === root.windows.length) return;
++            root.windows = list;
++            if (list.length < 2) {
++                root.cancel();
++                return;
++            }
++            root.selectedIndex = Math.max(0, list.findIndex(w => w.address === selected));
++        }
++    }
++
++    Timer {
++        id: syncTimer
++        interval: 300
++        onTriggered: {
++            historyReader.startedAt = root.sessionCount;
++            historyReader.running = true;
++        }
++    }
++
++    Process {
++        id: historyReader
++        // A reply from before the latest session is stale and must be dropped.
++        property int startedAt: 0
++        running: true
++        command: ["hyprctl", "-j", "clients"]
++        stdout: StdioCollector {
++            onStreamFinished: {
++                try {
++                    if (historyReader.startedAt !== root.sessionCount) return;
++                    root.mru = JSON.parse(text).sort((a, b) => a.focusHistoryID - b.focusHistoryID).map(c => c.address);
++                } catch (e) {
++                    console.warn("WindowSwitcher: no focus history", e);
++                }
++            }
++        }
++    }
++}
+diff -ruN a/modules/widgets/overview/OverviewPopup.qml b/modules/widgets/overview/OverviewPopup.qml
+--- a/modules/widgets/overview/OverviewPopup.qml	2026-11-01 01:39:58.835514166 +0100
++++ b/modules/widgets/overview/OverviewPopup.qml	2026-11-01 11:18:43.437425462 +0100
+@@ -25,18 +25,43 @@
+ 
+     WlrLayershell.layer: WlrLayer.Overlay
+     WlrLayershell.namespace: "ambxst:overview"
+-    WlrLayershell.keyboardFocus: overviewOpen ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
++    WlrLayershell.keyboardFocus: interactive ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
+ 
+     // Get this screen's visibility state
+     readonly property var screenVisibilities: Visibilities.getForScreen(screen.name)
+     readonly property bool overviewOpen: screenVisibilities ? screenVisibilities.overview : false
++    // While the switcher prepares its previews the overlay stays invisible and takes no input.
++    readonly property bool interactive: overviewOpen && (!WindowSwitcher.shown || WindowSwitcher.revealed)
++    property real switcherReveal: 0
++
++    NumberAnimation {
++        id: switcherRevealAnimation
++        target: overviewPopup
++        property: "switcherReveal"
++        from: 0
++        to: 1
++        duration: Config.animDuration > 0 ? 150 : 0
++        easing.type: Easing.OutCubic
++    }
++
++    Connections {
++        target: WindowSwitcher
++        function onRevealedChanged() {
++            if (WindowSwitcher.revealed) {
++                switcherRevealAnimation.restart();
++            } else {
++                switcherRevealAnimation.stop();
++                overviewPopup.switcherReveal = 0;
++            }
++        }
++    }
+ 
+     visible: overviewOpen
+     exclusionMode: ExclusionMode.Ignore
+ 
+     // Mask to capture input on the entire window when open
+     mask: Region {
+-        item: overviewOpen ? fullMask : emptyMask
++        item: interactive ? fullMask : emptyMask
+     }
+ 
+     // Full screen mask when open
+@@ -55,7 +80,7 @@
+     FocusGrab {
+         id: focusGrab
+         windows: [overviewPopup]
+-        active: overviewOpen
++        active: interactive
+ 
+         onCleared: {
+             // Use Qt.callLater to avoid potential race conditions
+@@ -72,7 +97,7 @@
+         id: backdrop
+         anchors.fill: parent
+         color: Colors.scrim
+-        opacity: overviewOpen ? 0.5 : 0
++        opacity: overviewOpen && !WindowSwitcher.shown ? 0.5 : 0
+ 
+         Behavior on opacity {
+             enabled: Config.animDuration > 0
+@@ -97,11 +122,11 @@
+         width: Math.max(searchContainer.width, overviewContainer.width + (scrollbarContainer.visible ? scrollbarContainer.width + 8 : 0))
+         height: (searchContainer.visible ? searchContainer.height + 8 : 0) + overviewContainer.height
+ 
+-        opacity: overviewOpen ? 1 : 0
+-        scale: overviewOpen ? 1 : 0.9
++        opacity: WindowSwitcher.shown ? overviewPopup.switcherReveal : (interactive ? 1 : 0)
++        scale: WindowSwitcher.shown ? 0.97 + 0.03 * overviewPopup.switcherReveal : (overviewOpen ? 1 : 0.9)
+ 
+         Behavior on opacity {
+-            enabled: Config.animDuration > 0
++            enabled: Config.animDuration > 0 && !WindowSwitcher.shown
+             NumberAnimation {
+                 duration: Config.animDuration
+                 easing.type: Easing.OutQuart
+@@ -109,7 +134,7 @@
+         }
+ 
+         Behavior on scale {
+-            enabled: Config.animDuration > 0
++            enabled: Config.animDuration > 0 && !WindowSwitcher.shown
+             NumberAnimation {
+                 duration: Config.animDuration
+                 easing.type: Easing.OutBack
+@@ -120,7 +145,7 @@
+         // Search input container
+         StyledRect {
+             id: searchContainer
+-            visible: !GlobalStates.windowSwitcherActive
++            visible: !WindowSwitcher.shown
+             variant: "bg"
+             anchors.top: parent.top
+             anchors.horizontalCenter: parent.horizontalCenter
+@@ -306,7 +331,7 @@
+                 anchors.centerIn: parent
+                 active: overviewOpen
+ 
+-                sourceComponent: GlobalStates.windowSwitcherActive ? windowSwitcherComponent : workspaceOverviewComponent
++                sourceComponent: WindowSwitcher.shown ? windowSwitcherComponent : workspaceOverviewComponent
+             }
+         }
+ 
+@@ -394,11 +419,20 @@
+         WindowSwitcherView { currentScreen: overviewPopup.screen }
+     }
+ 
++    // Compile the switcher ahead of time, the first open would otherwise stall.
++    Loader {
++        active: !overviewOpen && !WindowSwitcher.session
++        asynchronous: true
++        visible: false
++        sourceComponent: windowSwitcherComponent
++    }
++
+     // Ensure focus when overview opens
+     onOverviewOpenChanged: {
+         if (overviewOpen) {
+             Qt.callLater(() => {
+-                if (GlobalStates.windowSwitcherActive) {
++                if (!overviewOpen) return;
++                if (WindowSwitcher.shown) {
+                     if (overviewLoader.item) overviewLoader.item.forceActiveFocus();
+                     return;
+                 }
+@@ -409,8 +443,7 @@
+                 searchInput.focusInput();
+             });
+         } else {
+-            GlobalStates.windowSwitcherActive = false;
+-            GlobalStates.windowSwitcherAcceptPending = false;
++            WindowSwitcher.overlayClosed();
+         }
+     }
+ }
+diff -ruN a/modules/widgets/overview/WindowSwitcherView.qml b/modules/widgets/overview/WindowSwitcherView.qml
+--- a/modules/widgets/overview/WindowSwitcherView.qml	2026-11-01 01:39:58.854707276 +0100
++++ b/modules/widgets/overview/WindowSwitcherView.qml	2026-11-01 11:18:43.437275734 +0100
+@@ -1,6 +1,6 @@
+ import QtQuick
+-import QtQuick.Layouts
+ import Quickshell
++import Quickshell.Hyprland
+ import Quickshell.Widgets
+ import Quickshell.Wayland
+ import qs.config
+@@ -8,91 +8,120 @@
+ import qs.modules.theme
+ import qs.modules.services
+ import qs.modules.globals
+-import qs.modules.bar.workspaces
+ 
+ Item {
+     id: root
+     required property var currentScreen
+-    property var windows: []
+-    property int selectedIndex: 0
+     property string searchQuery: ""
+-    readonly property var matchingWindows: windows
+-    readonly property int selectedMatchIndex: selectedIndex
++    readonly property var matchingWindows: WindowSwitcher.windows
++    readonly property int selectedMatchIndex: WindowSwitcher.selectedIndex
+     readonly property bool needsScrollbar: false
+-    readonly property real cardWidth: Math.max(180, Math.min(260, currentScreen.width * Config.overview.scale))
+-    readonly property real cardHeight: cardWidth * 0.65 + 40
+-    implicitWidth: cards.implicitWidth
++    readonly property real previewHeight: Math.max(110, Math.min(170, currentScreen.height * Config.overview.scale))
++    readonly property real cardHeight: previewHeight + 46
++    readonly property real maxRowWidth: currentScreen.width * 0.9 - 48
++    readonly property real rowWidth: {
++        let widest = 0;
++        let row = 0;
++        for (const w of WindowSwitcher.windows) {
++            const width = cardWidthFor(w);
++            row = row === 0 ? width : row + cards.spacing + width;
++            if (row > maxRowWidth) row = width;
++            widest = Math.max(widest, row);
++        }
++        return widest;
++    }
++    property int previewsDone: 0
++    implicitWidth: rowWidth
+     implicitHeight: cards.implicitHeight
+ 
+-    function step(direction) {
+-        if (windows.length) selectedIndex = (selectedIndex + direction + windows.length) % windows.length;
++    // Cards follow the shape of their window.
++    function cardWidthFor(win) {
++        const size = win.size || [];
++        const aspect = size[0] > 0 && size[1] > 0 ? size[0] / size[1] : 16 / 9;
++        return Math.max(130, Math.min(previewHeight * 2.2, previewHeight * aspect)) + 16;
+     }
+ 
+     function resetSearch() { searchQuery = ""; }
+-    function selectNextMatch() { step(1); }
+-    function selectPrevMatch() { step(-1); }
+-    function navigateToSelectedWindow() { accept(); }
+-
+-    function accept(index = selectedIndex) {
+-        const address = windows[index]?.address;
+-        Visibilities.setActiveModule("");
+-        if (address) AxctlService.dispatch(`focuswindow address:${address}`);
+-    }
++    function selectNextMatch() { WindowSwitcher.step(1); }
++    function selectPrevMatch() { WindowSwitcher.step(-1); }
++    function navigateToSelectedWindow() { WindowSwitcher.accept(); }
+ 
+-    Component.onCompleted: {
+-        const focused = AxctlService.focusedClient?.address;
+-        windows = CompositorData.windowList.filter(w => w.workspace?.id > 0)
+-            .slice().sort((a, b) => (a.focusHistoryID ?? 999999) - (b.focusHistoryID ?? 999999));
+-        const current = windows.findIndex(w => w.address === focused);
+-        selectedIndex = Math.max(0, current);
+-        step(GlobalStates.windowSwitcherDirection);
+-        forceActiveFocus();
+-        if (GlobalStates.windowSwitcherAcceptPending) Qt.callLater(() => root.accept());
+-    }
+-
+-    Connections {
+-        target: GlobalStates
+-        function onWindowSwitcherStepRequested(direction) { root.step(direction); }
+-        function onWindowSwitcherAcceptRequested() { root.accept(); }
+-    }
++    Component.onCompleted: forceActiveFocus()
+ 
+     Keys.onPressed: event => {
+-        if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+-            step(event.key === Qt.Key_Backtab || (event.modifiers & Qt.ShiftModifier) ? -1 : 1);
+-        } else if (event.key === Qt.Key_Left) step(-1);
+-        else if (event.key === Qt.Key_Right) step(1);
+-        else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) accept();
+-        else if (event.key === Qt.Key_Escape) Visibilities.setActiveModule("");
++        if (event.key === Qt.Key_Tab || event.key === Qt.Key_Right) WindowSwitcher.step(1);
++        else if (event.key === Qt.Key_Backtab || event.key === Qt.Key_Left) WindowSwitcher.step(-1);
++        else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) WindowSwitcher.accept();
++        else if (event.key === Qt.Key_Escape) WindowSwitcher.cancel();
+         else return;
+         event.accepted = true;
+     }
+ 
+     Keys.onReleased: event => {
+         if (event.key === Qt.Key_Alt || event.key === Qt.Key_AltGr) {
+-            accept();
++            WindowSwitcher.accept();
+             event.accepted = true;
+         }
+     }
+ 
+-    GridLayout {
++    // One rectangle slides between the cards, nothing else animates.
++    Rectangle {
++        id: selection
++        readonly property var target: cardRepeater.count > WindowSwitcher.selectedIndex ? cardRepeater.itemAt(WindowSwitcher.selectedIndex) : null
++        visible: target !== null
++        x: target ? target.x : 0
++        y: target ? target.y : 0
++        width: target ? target.width : 0
++        height: target ? target.height : 0
++        radius: Styling.radius(2)
++        color: Qt.alpha(Colors.primary, 0.18)
++        border.width: 2
++        border.color: Colors.primary
++
++        Behavior on x {
++            enabled: Config.animDuration > 0 && WindowSwitcher.revealed
++            NumberAnimation { duration: 180; easing.type: Easing.OutQuint }
++        }
++        Behavior on y {
++            enabled: Config.animDuration > 0 && WindowSwitcher.revealed
++            NumberAnimation { duration: 180; easing.type: Easing.OutQuint }
++        }
++        Behavior on height {
++            enabled: Config.animDuration > 0 && WindowSwitcher.revealed
++            NumberAnimation { duration: 180; easing.type: Easing.OutQuint }
++        }
++        Behavior on width {
++            enabled: Config.animDuration > 0 && WindowSwitcher.revealed
++            NumberAnimation { duration: 180; easing.type: Easing.OutQuint }
++        }
++    }
++
++    Flow {
+         id: cards
+-        columns: Math.max(1, Math.min(5, root.windows.length))
+-        rowSpacing: Config.overview.workspaceSpacing
+-        columnSpacing: Config.overview.workspaceSpacing
++        width: root.rowWidth
++        spacing: Config.overview.workspaceSpacing
+ 
+         Repeater {
+-            model: root.windows
+-            StyledRect {
++            id: cardRepeater
++            model: WindowSwitcher.windows
++            Rectangle {
+                 id: card
+                 required property var modelData
+                 required property int index
+-                Layout.preferredWidth: root.cardWidth
+-                Layout.preferredHeight: root.cardHeight
+-                variant: "pane"
++                readonly property bool selected: index === WindowSwitcher.selectedIndex
++                width: root.cardWidthFor(modelData)
++                height: root.cardHeight
+                 radius: Styling.radius(2)
++                color: !selected && cardMouse.containsMouse ? Qt.alpha(Colors.overBackground, 0.06) : "transparent"
++
++                Behavior on color {
++                    enabled: Config.animDuration > 0
++                    ColorAnimation { duration: 120 }
++                }
++
+                 readonly property var toplevel: {
+-                    const candidates = ToplevelManager.toplevels.values.filter(t => t.appId === modelData.class);
+-                    return candidates.find(t => t.title === modelData.title) || candidates[0] || null;
++                    const hyprToplevel = Hyprland.toplevels.values.find(t => "0x" + t.address === modelData.address);
++                    return hyprToplevel ? hyprToplevel.wayland : null;
+                 }
+ 
+                 Column {
+@@ -100,51 +129,59 @@
+                     anchors.margins: 8
+                     spacing: 6
+ 
+-                    Text {
++                    Row {
+                         width: parent.width
+-                        text: card.modelData.title || card.modelData.class
+-                        color: Colors.overBackground
+-                        font.family: Config.theme.font
+-                        font.pixelSize: Config.theme.fontSize
+-                        elide: Text.ElideRight
++                        height: 24
++                        spacing: 6
++
++                        IconImage {
++                            anchors.verticalCenter: parent.verticalCenter
++                            implicitSize: 20
++                            asynchronous: true
++                            source: Quickshell.iconPath(AppSearch.guessIcon(card.modelData.class), "image-missing")
++                        }
++
++                        Text {
++                            anchors.verticalCenter: parent.verticalCenter
++                            width: parent.width - 26
++                            text: card.modelData.title || card.modelData.class
++                            color: card.selected ? Colors.primary : Colors.overBackground
++                            font.family: Config.theme.font
++                            font.pixelSize: Config.theme.fontSize
++
++                            Behavior on color {
++                                enabled: Config.animDuration > 0
++                                ColorAnimation { duration: 160 }
++                            }
++                            elide: Text.ElideRight
++                        }
+                     }
+ 
+                     ClippingRectangle {
+                         width: parent.width
+-                        height: root.cardHeight - 46
+-                        radius: Styling.radius(-4)
++                        height: root.previewHeight
++                        radius: Styling.radius(-2)
+                         color: Colors.surfaceContainerLow
+ 
+                         ScreencopyView {
+                             id: preview
+                             anchors.fill: parent
+-                            captureSource: Config.performance.windowPreview ? card.toplevel : null
+-                            live: true
+-                        }
+-
+-                        Text {
+-                            anchors.centerIn: parent
+-                            visible: !preview.hasContent
+-                            text: Icons.apps
+-                            font.family: Icons.font
+-                            font.pixelSize: Styling.fontSize(24)
+-                            color: Colors.overBackground
++                            captureSource: card.toplevel
++                            live: false
++                            onHasContentChanged: {
++                                if (!hasContent) return;
++                                root.previewsDone++;
++                                if (root.previewsDone >= WindowSwitcher.windows.length) WindowSwitcher.previewsReady = true;
++                            }
+                         }
+                     }
+                 }
+ 
+-                Rectangle {
+-                    anchors.fill: parent
+-                    color: "transparent"
+-                    radius: Styling.radius(2)
+-                    border.width: card.index === root.selectedIndex ? 3 : 0
+-                    border.color: Colors.primary
+-                }
+-
+                 MouseArea {
++                    id: cardMouse
+                     anchors.fill: parent
+                     hoverEnabled: true
+-                    onClicked: root.accept(card.index)
++                    onClicked: WindowSwitcher.accept(card.index)
+                 }
+             }
+         }

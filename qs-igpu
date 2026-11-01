@@ -1,0 +1,4 @@
+#!/bin/sh
+# Quickshell imports compositor screencopy buffers, which fails fatally when it
+# renders on the NVIDIA GPU while Hyprland composites on Intel.
+exec env -u __NV_PRIME_RENDER_OFFLOAD -u __VK_LAYER_NV_optimus -u __GLX_VENDOR_LIBRARY_NAME qs "$@"
